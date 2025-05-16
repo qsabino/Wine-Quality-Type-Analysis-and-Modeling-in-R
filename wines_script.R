@@ -1,0 +1,715 @@
+
+#####################################################
+
+# Wine Quality & Type Analysis and Modeling in R
+
+#####################################################
+
+
+# Install and load libraries
+
+if(!require(corrplot))      install.packages("corrplot")
+if(!require(ggcorrplot))    install.packages("ggcorrplot")
+if(!require(GGally))        install.packages("GGally")
+if(!require(xgboost))       install.packages("xgboost")
+if(!require(Rtsne))         install.packages("Rtsne")
+if(!require(umap))          install.packages("umap")
+if(!require(HandTill2001))  install.packages("HandTill2001")
+if(!require(ranger))        install.packages("ranger")
+if(!require(rpart.plot))    install.packages("rpart.plot")
+
+
+library(tidyverse)
+library(e1071)        # for naiveBayes()
+library(purrr)        # for map_dbl()
+library(ggplot2)      # for ggplot()
+library(corrplot)     # for corrplot()
+library(GGally)       # for ggpairs()
+library(caret)        # for createDataPartition(), trainControl()
+library(e1071)        # for svm()
+library(randomForest) # for randomForest()
+library(xgboost)      # for xgb
+library(pROC)         # for roc() and auc()
+library(Metrics)      # for rmse(), mae(), R2()
+library(rpart)        # for rpart()
+library(nnet)         # for multinom(), multinomial logistic regression
+library(tidyr)        # for pivot_longer()
+library(Rtsne)        # for t-SNE, Rtsne()
+library(umap)         # for UMAP, umap()
+library(cluster)      # for silhouette()
+library(HandTill2001) # for multcap(), multiclass AUC
+library(ranger)       # for ranger()
+library(rpart.plot)   # for rpart.plot
+library(MASS)         # for polr()
+
+
+
+# Read in data
+
+red <- read.csv("winequality-red.csv", header = TRUE, sep = ";")
+white <- read.csv("winequality-white.csv", header = TRUE, sep = ";")
+wines <- rbind(
+  data.frame(type = "red", red),
+  data.frame(type = "white", white)
+)
+
+str(wines)
+head(wines)
+
+
+
+############################
+
+# ANALYSIS TASK
+
+###########################
+
+
+# Check for missing values
+colSums(is.na(wines))
+
+# Summary Statistics
+summary(wines)
+
+# Grouped by wine type
+wines %>%
+  group_by(type) %>%
+  summarize(across(where(is.numeric), 
+                   list(mean = mean, sd = sd), 
+                   .names = "{.col}_{.fn}")
+            )
+
+# Numeric features only
+wines_numeric <- select_if(wines, is.numeric)
+
+# Alcohol distribution by wine type
+ggplot(wines, aes(x = alcohol, fill = type)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Alcohol Content by Wine Type")
+
+# pH comparison by wine type
+ggplot(wines, aes(x = type, y = pH, fill = type)) +
+  geom_boxplot() +
+  labs(title = "pH Distribution by Wine Type")
+
+# Quality distribution by wine type
+ggplot(wines, aes(x = quality, fill = type)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Wine Quality Distribution by Type")
+
+# Boxplots for selected features, plot multiple boxplots
+wines_long <- wines %>%
+  pivot_longer(cols = -c(type, quality), names_to = "variable", values_to = "value")
+
+ggplot(wines_long, aes(x = variable, y = value)) +
+  geom_boxplot(outlier.colour = "blue", outlier.size = 1) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Boxplots for Outlier Detection")
+
+# Z-score based outlier detection
+free.sulfur.dioxide_outliers <- wines %>%
+  # Convert 1-column matrix from scale() to a numeric vector
+  mutate(free.sulfur.dioxide_z = as.numeric(scale(free.sulfur.dioxide))) %>% 
+  # Filter potential outliers
+  filter(abs(free.sulfur.dioxide_z) > 3)
+
+residual.sugar_outliers <- wines %>%
+  mutate(residual.sugar_z = scale(residual.sugar)) %>% 
+  # Filter potential outliers
+  filter(abs(residual.sugar_z) > 3)
+
+
+# Compute correlation matrix
+corr_matrix <- cor(wines_numeric)
+
+# Correlation plot
+corrplot(corr_matrix, 
+         method = "color", 
+         type = "lower", 
+         tl.cex = 0.8,          # Text size of the variable names
+         addCoef.col = "black", # Adds correlation values in black
+         number.cex = 0.7)      # Adjust the text size of corr values
+
+# Pairwise plot of a subset of key features (This is powerful but slow for many features)
+ggpairs(wines, 
+        columns = c("fixed.acidity", "volatile.acidity", "citric.acid", "residual.sugar", "alcohol", "quality"),
+        mapping = aes(color = type)
+        )
+
+# Alcohol vs. Density
+ggplot(wines, aes(x = density, y = alcohol, color = type)) +
+  geom_point(alpha = 0.5) +
+  labs(title = "Alcohol vs. Density by Wine Type") +
+  theme_minimal()
+
+# Colored by Quality (instead of type)
+ggplot(wines, aes(x = volatile.acidity, y = citric.acid, color = as.factor(quality))) +
+  geom_point(alpha = 0.7) +
+  labs(title = "Volatile Acidity vs. Citric Acid Colored by Quality",
+       color = "Quality") +
+  theme_minimal()
+
+
+
+#####################################
+
+# MODELING TASK
+
+####################################
+
+
+#-------------------------------------------------------------------------
+
+# I. BINARY CLASSIFICATION
+# Goal: Predict type (red or white) using physicochemical features.
+
+#-------------------------------------------------------------------------
+
+
+# Encode 'type' as a binary factor: red = 0, white = 1
+wines$type <- factor(ifelse(wines$type == "white", 1, 0), levels = c(0, 1))
+
+# Train/test split
+set.seed(1)
+index <- createDataPartition(wines$type, p = 0.8, list = FALSE)
+train <- wines[index, ]
+test <- wines[-index, ]
+
+# Features and labels
+train_x <- train %>% dplyr::select(-type)
+train_y <- train$type
+
+test_x <- test %>% dplyr::select(-type)
+test_y <- test$type
+
+
+#-------------------------------------------
+# 1. Logistic Binary Classification
+#-------------------------------------------
+
+# Fit model
+glm_model <- glm(type ~ ., data = train, family = "binomial")
+
+# Predict
+glm_prob <- predict(glm_model, test, type = "response")
+
+# Class prediction from probabilities:
+glm_class <- ifelse(glm_prob > 0.5, 1, 0)
+glm_class <- factor(glm_class, levels = levels(test_y))
+
+# Evaluation
+confusionMatrix(glm_class, test_y) # 'Positive' Class : 0
+glm_roc <- roc(test_y, glm_prob)
+glm_auc <- pROC::auc(glm_roc) # getAnywhere(auc) to check which version of auc() is active
+glm_auc
+
+
+#----------------------------------------------
+# 2. Random Forest Binary Classification
+#----------------------------------------------
+
+# Fit model
+rf_model <- randomForest(type ~ ., data = train, ntree = 100)
+
+# Predict
+rf_prob <- predict(rf_model, test, type = "prob") # colnames(rf_prob) to get column names
+
+# Class prediction from probabilities:
+rf_class <- ifelse(rf_prob[, "1"] > 0.5, 1, 0) 
+rf_class <- factor(rf_class, levels = levels(test_y))
+
+# Evaluation
+confusionMatrix(rf_class, test_y)
+rf_roc <- roc(test_y, rf_prob[, "1"]) 
+rf_auc <- pROC::auc(rf_roc)
+rf_auc
+
+# Feature Importance — Random Forest
+# View variable importance
+randomForest::importance(rf_model)
+
+# Plot importance
+# Higher values indicate greater importance in classification splits.
+varImpPlot(rf_model, main = "Random Forest Feature Importance")
+
+
+#----------------------------------------------------------
+# 3. Support Vector Machine (SVM) Binary Classification
+#----------------------------------------------------------
+
+# Fit model
+svm_model <- svm(type ~ ., data = train, probability = TRUE)
+
+# Predict
+svm_pred <- predict(svm_model, test, probability = TRUE)
+svm_prob <- attr(svm_pred, "probabilities")
+
+# Class prediction from probabilities:
+svm_class <- ifelse(svm_prob[, "1"] > 0.5, 1, 0)
+svm_class <- factor(svm_class, levels = levels(test_y))
+
+# Evaluation
+confusionMatrix(svm_class, test_y)
+svm_roc <- roc(test_y, svm_prob[, "1"])
+svm_auc <- pROC::auc(svm_roc)
+svm_auc
+
+
+#--------------------------------------
+# 4. XGBoost Binary Classification
+#--------------------------------------
+
+# XGBoost needs numeric data and numeric labels.
+# Prepare data
+train_matrix <- xgb.DMatrix(data = as.matrix(train_x), label = as.numeric(as.character(train_y)))
+test_matrix  <- xgb.DMatrix(data = as.matrix(test_x),  label = as.numeric(as.character(test_y)))
+
+# Fit model
+xgb_model <- xgboost(data = train_matrix, 
+                     objective = "binary:logistic",
+                     nrounds = 100, 
+                     verbose = 0) # Suppresses training output — no messages while training
+
+# Predict
+xgb_prob <- predict(xgb_model, test_matrix)
+
+# Class prediction from probabilities:
+xgb_class <- ifelse(xgb_prob > 0.5, 1, 0)
+xgb_class <- factor(xgb_class, levels = levels(test_y))
+
+# Evaluation
+confusionMatrix(xgb_class, test_y)
+xgb_roc <- roc(test_y, xgb_prob)
+xgb_auc <- pROC::auc(xgb_roc)
+xgb_auc
+
+# Feature Importance — XGBoost
+# Get importance matrix
+importance_matrix <- xgb.importance(model = xgb_model)
+
+# Access the raw table
+# "weight/frequency" = number of times a feature is used in a tree
+# "gain" = average gain when it is used
+# "cover" = number of samples affected
+print(importance_matrix)
+
+# Plot importance
+xgb.plot.importance(importance_matrix, top_n = 10, 
+                    main = "XGBoost Feature Importance")
+
+
+# Summary
+auc_comparison <- tibble(
+  Models = c("Logistic", "Random Forest", "Support Vector Machine (SVM)", "XGBoost"),
+  AUC = c(glm_auc, rf_auc, svm_auc, xgb_auc)
+)
+auc_comparison
+
+# AUCs Comparison Plot
+plot(glm_roc, col = "blue", main = "ROC Curves", lwd = 2)
+lines(rf_roc, col = "green", lwd = 2)
+lines(svm_roc, col = "purple", lwd = 2)
+lines(xgb_roc, col = "red", lwd = 2)
+legend("bottomright", legend = c("Logistic", "RF", "SVM", "XGBoost"),
+       col = c("blue", "green", "purple", "red"), lwd = 2)
+
+
+
+#--------------------------------------------------------
+
+# II.REGRESSION: Predict Wine Quality
+# Goal: Predict quality as a numeric score (0 to 9)
+
+#--------------------------------------------------------
+
+# Drop 'type', we don't use 'type' for prediction
+wines_reg <- wines %>% select(-type)
+
+# Train/test split
+set.seed(12)
+index <- createDataPartition(wines_reg$quality, p = 0.8, list = FALSE)
+train <- wines_reg[index, ]
+test <- wines_reg[-index, ]
+
+# Separate features and target
+train_x <- train %>% select(-quality)
+train_y <- train$quality
+
+test_x <- test %>% select(-quality)
+test_y <- test$quality
+
+
+#------------------------------
+# 1. Linear Regression
+#------------------------------
+
+# Fit model
+lm_model <- lm(quality ~ ., data = train)
+
+# Predict
+lm_pred <- predict(lm_model, test)
+
+# Evaluation
+lm_rmse <- rmse(test_y, lm_pred)
+lm_mae  <- mae(test_y, lm_pred)
+lm_r2   <- R2(lm_pred, test_y)
+
+cat("Linear Regression:\n",
+    "RMSE:", lm_rmse, 
+    "\nMAE:", lm_mae, 
+    "\nR²:", lm_r2, "\n")
+
+
+#----------------------------------
+# 2. Decision Tree Regression
+#----------------------------------
+
+# Fit model
+tree_model <- rpart(quality ~ ., data = train, method = "anova")
+
+# Plot the tree
+# Each leaf node shows the predicted quality for wines in that segment.
+rpart.plot(tree_model)
+
+# Predict
+tree_pred <- predict(tree_model, test)
+
+# Evaluation
+tree_rmse <- rmse(test_y, tree_pred)
+tree_mae  <- mae(test_y, tree_pred)
+tree_r2   <- R2(tree_pred, test_y)
+
+cat("Decision Tree:\n",
+    "RMSE:", tree_rmse, 
+    "\nMAE:", tree_mae, 
+    "\nR²:", tree_r2, "\n")
+
+
+#----------------------------------
+# 3. Random Forest Regression
+#----------------------------------
+
+# Fit model
+rf_model_reg <- randomForest(quality ~ ., data = train, ntree = 100)
+
+# Predict
+rf_pred <- predict(rf_model_reg, test)
+
+# Evaluation
+rf_rmse <- rmse(test_y, rf_pred)
+rf_mae  <- mae(test_y, rf_pred)
+rf_r2   <- R2(rf_pred, test_y)
+
+cat("Random Forest:\n",
+    "RMSE:", rf_rmse, 
+    "\nMAE:", rf_mae, 
+    "\nR²:", rf_r2, "\n")
+
+# Feature importance
+randomForest::importance(rf_model_reg)
+varImpPlot(rf_model_reg)
+
+
+#------------------------------
+# 4. XGBoost Regression
+#------------------------------
+
+# Prepare matrices
+train_matrix <- xgb.DMatrix(data = as.matrix(train_x), label = as.numeric(as.character(train_y)))
+test_matrix  <- xgb.DMatrix(data = as.matrix(test_x),  label = as.numeric(as.character(test_y)))
+
+# Fit model
+xgb_model_reg <- xgboost(data = train_matrix,
+                         objective = "reg:squarederror",
+                         nrounds = 100, 
+                         verbose = 0)
+
+# Predict
+xgb_pred <- predict(xgb_model_reg, test_matrix)
+
+# Evaluation
+xgb_rmse <- rmse(test_y, xgb_pred)
+xgb_mae  <- mae(test_y, xgb_pred)
+xgb_r2   <- R2(xgb_pred, test_y)
+
+cat("XGBoost:\n",
+    "RMSE:", xgb_rmse, 
+    "\nMAE:", xgb_mae, 
+    "\nR²:", xgb_r2, "\n")
+
+# Get Feature Importance from XGBoost
+# Extract importance scores
+importance <- xgb.importance(model = xgb_model_reg)
+
+# Plot Feature Importance
+# Plot top 10 most important features by gain
+xgb.plot.importance(importance, top_n = 10,
+                    # Scale all feature importance scores relative to the most important feature
+                    rel_to_first = TRUE,
+                    main = "XGBoost Feature Importance (Regression)",
+                    xlab = "Relative Importance")
+
+
+# View full importance table
+print(importance)
+
+# View top 10 importance features, sorted by Gain.
+# High Gain = large impact per use → most valuable features
+importance %>%
+  arrange(desc(Gain)) %>%
+  head(10)
+
+
+# Summary
+metrics_comparison <- tibble(
+  Model = c("Linear Regression", "Decision Tree", "Random Forest", "XGBoost"),
+  RMSE  = c(lm_rmse, tree_rmse, rf_rmse, xgb_rmse),
+  MAE   = c(lm_mae, tree_mae, rf_mae, xgb_mae),
+  R2    = c(lm_r2, tree_r2, rf_r2, xgb_r2)
+)
+
+metrics_comparison
+
+
+
+
+#----------------------------------------------------------------------------
+
+# III. MULTICLASS CLASSIFICATION: Predict Discrete Quality
+# Goal: Treat quality as a classification problem instead of regression
+
+#----------------------------------------------------------------------------
+
+
+# Convert quality to factor (multiclass)
+wines_class <- wines %>% select(-type)
+wines_class$quality <- factor(wines_class$quality)
+
+# Train/test split
+set.seed(123)
+index <- createDataPartition(wines_class$quality, p = 0.8, list = FALSE)
+train <- wines_class[index, ]
+test <- wines_class[-index, ]
+
+train_x <- train %>% select(-quality)
+train_y <- train$quality
+
+test_x <- test %>% select(-quality)
+test_y <- test$quality
+
+
+#----------------------------------------------------------
+# 1. Multinomial Logistic - Multiclass Classification
+#----------------------------------------------------------
+
+# Fit model
+multinom_model <- multinom(quality ~ ., data = train)
+
+# Predict
+multinom_prob <- predict(multinom_model, test, type = "prob")
+head(multinom_prob)
+multinom_class <- predict(multinom_model, test)
+
+# Rename columns to match class labels
+colnames(multinom_prob) <- levels(test_y)
+# Confirm the internal match
+all.equal(sort(colnames(multinom_prob)), sort(levels(test_y)))
+
+# Evaluation
+confusionMatrix(multinom_class, test_y)
+multinom_mc <- multcap(response = test_y, predicted = multinom_prob)
+multinom_auc <- HandTill2001::auc(multinom_mc)
+multinom_auc
+
+
+#------------------------------------------------------
+# 2. Ordinal Logistic - Multiclass Classification
+# -----------------------------------------------------
+
+# Ensure quality is an ordered factor
+train$quality <- ordered(train$quality)
+test$quality  <- ordered(test$quality)
+
+# Fit model
+polr_model <- polr(quality ~ ., data = train, method = "logistic")
+
+# Predict
+polr_prob <- predict(polr_model, newdata = test, type = "probs")
+head(polr_prob)
+polr_class <- predict(polr_model, newdata = test)
+
+# Rename columns to match class labels
+colnames(polr_prob) <- levels(test_y)
+# Confirm the internal match
+all.equal(sort(colnames(polr_prob)), sort(levels(test_y)))
+
+# Evaluation
+confusionMatrix(polr_class, test$quality)
+ordinal_mc <- multcap(response = test$quality, predicted = polr_prob)
+ordinal_auc <- HandTill2001::auc(ordinal_mc)
+ordinal_auc
+
+
+#--------------------------------------------------------
+# 3. Random Forest - Multiclass Classification
+#--------------------------------------------------------
+
+# Fit model
+rf_model_multi <- randomForest(quality ~ ., data = train, ntree = 100)
+
+# Predict
+rf_prob_multi <- predict(rf_model_multi, newdata = test, type = "prob")
+head(rf_prob_multi)
+rf_class_multi <- predict(rf_model_multi, test)
+
+# Rename columns to match class labels
+colnames(rf_prob_multi) <- levels(test_y)
+# Confirm the internal match
+all.equal(sort(colnames(rf_prob_multi)), sort(levels(test_y)))
+
+# Evaluation
+cm <- confusionMatrix(rf_class_multi, test_y)
+cm
+rf_mc <- multcap(response = test_y, predicted = rf_prob_multi)
+rf_auc_multi <- HandTill2001::auc(rf_mc)
+rf_auc_multi
+
+# Feature importance
+randomForest::importance(rf_model_multi)
+varImpPlot(rf_model_multi)
+
+# Plot Confusion Matrix
+# Example using RF results
+cm_table <- as.data.frame(cm$table)
+cm_table
+
+ggplot(cm_table, aes(Prediction, Reference, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white") +
+  scale_fill_gradient(low = "lightblue", high = "red") +
+  theme_minimal() +
+  labs(title = "Confusion Matrix - Random Forest")
+
+
+
+#-----------------------------------------------------------------
+# 4. ranger - Multiclass Classification
+# ranger is a fast and efficient Random Forest implementation
+#-----------------------------------------------------------------
+
+# Fit model
+ranger_model <- ranger(
+  formula = quality ~ .,
+  data = train,
+  probability = TRUE,
+  num.trees = 100,
+  importance = "impurity"  # optional: gives Gini importance, aka Mean Decrease in Impurity for each feature.
+)
+
+# Predict
+ranger_pred <- predict(ranger_model, data = test)
+ranger_pred
+
+# Extract predicted probabilities
+ranger_prob <- ranger_pred$predictions  # matrix of probabilities
+head(ranger_prob)
+
+# Get class predictions
+# Or if probability = FALSE, predict() will return predicted classes directly.
+# Converts the index to the class label
+ranger_class <- colnames(ranger_prob)[apply(ranger_prob, 1, which.max)] 
+ranger_class <- factor(ranger_class, levels = levels(test_y))
+
+# Rename columns to match class labels
+colnames(ranger_prob) <- levels(test_y)
+# Confirm the internal match
+all.equal(sort(colnames(ranger_prob)), sort(levels(test_y)))
+
+# Evaluation
+cm <- confusionMatrix(ranger_class, test_y)
+cm$table
+
+ranger_mc <- multcap(response = test_y, predicted = ranger_prob)
+ranger_auc <- HandTill2001::auc(ranger_mc)
+ranger_auc
+
+
+
+#--------------------------------------------
+# 5. XGBoost - Multiclass Classification
+#--------------------------------------------
+
+# XGBoost expects:
+# Label: integers from 0 to num_class - 1
+# train_matrix and test_matrix are xgb.DMatrix objects
+
+# Convert factor to numeric (0-based indexing)
+# XGBoost labels must start at 0 — not 1 or 3 or 5.
+
+# Original factor with labels
+original_labels <- levels(test_y)
+
+train_label <- as.numeric(train_y) - 1
+test_label  <- as.numeric(test_y) - 1
+
+# Model matrix for features
+train_matrix <- xgb.DMatrix(data = as.matrix(train_x), label = train_label)
+test_matrix  <- xgb.DMatrix(data = as.matrix(test_x), label = test_label)
+
+num_class = length(levels(wines_class$quality))
+
+# Train model
+xgb_model_multi <- xgboost(data = train_matrix,
+                           objective = "multi:softprob", # always used for multiclass probability output
+                           num_class = num_class,
+                           nrounds = 100, 
+                           verbose = 0)
+
+# Get raw predictions, predicted probabilities
+xgb_prob_multi <- predict(xgb_model_multi, test_matrix)
+
+# Reshape into matrix: rows = samples, columns = class probabilities
+xgb_prob_multi <- matrix(xgb_prob_multi, ncol = num_class, byrow = TRUE)
+
+# Due to floating-point precision errors, especially when reshaping the output
+# Normalize each row to sum to 1 for multcap() to work
+xgb_prob_multi <- xgb_prob_multi / rowSums(xgb_prob_multi)
+
+# Predicted classes, 
+# Or use objective = "multi:softmax", predict() will return predicted classes directly.
+# Predicted class index
+pred_class_index <- max.col(xgb_prob_multi) - 1  # 0-based
+
+# Map back to original labels
+xgb_class_multi <- original_labels[pred_class_index + 1]
+xgb_class_multi <- factor(xgb_class_multi, levels = original_labels)
+
+# Evaluation
+cm <- confusionMatrix(xgb_class_multi, test_y)
+cm$table
+
+
+# Label the columns with the original factor levels
+colnames(xgb_prob_multi) <- levels(train_y)
+
+# Compute Multiclass AUC
+# Create multcap object and compute AUC
+xgb_mc <- multcap(response = test_y, predicted = xgb_prob_multi)
+xgb_auc_multi <- auc(xgb_mc)
+xgb_auc_multi
+
+
+# Summary
+auc_comparison_multi <- tibble(
+  Model    = c("Multinomial Logistic", "Ordinal Logistic", "Random Forest", "Random Forest - ranger", "XGBoost"),
+  AUC      = c(multinom_auc,ordinal_auc, rf_auc_multi, ranger_auc, xgb_auc_multi),
+)
+
+auc_comparison_multi
+
+
+
+
+
+
+
